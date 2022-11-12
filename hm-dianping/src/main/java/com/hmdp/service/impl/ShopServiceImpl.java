@@ -13,6 +13,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisData;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -39,8 +40,11 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     private StringRedisTemplate stringRedisTemplate;
 
-    public ShopServiceImpl(StringRedisTemplate stringRedisTemplate) {
+    private CacheClient cacheClient;
+
+    public ShopServiceImpl(StringRedisTemplate stringRedisTemplate,CacheClient cacheClient) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.cacheClient = cacheClient;
     }
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
@@ -49,15 +53,26 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 空对象解决缓存穿透
         // Shop shop = queryWithPassThrough(id);
-
-        // 互斥锁解决缓存穿透
+        // 互斥锁解决缓存击穿
         // Shop shop = queryWithMutex(id);
+        // 逻辑时间解决缓存击穿
+        // Shop shop = queryWithLogicExpire(id);
 
-        // 逻辑时间解决缓存穿透
-        Shop shop = queryWithLogicExpire(id);
+        // Redis工具类
+        // Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        Shop shop = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, 20l, TimeUnit.SECONDS);
+        if (shop == null) {
+            return Result.fail("店铺不存在！");
+        }
         return Result.ok(shop);
     }
 
+    /**
+     * 逻辑过期处理缓存击穿
+     * redis的过期时间实际是无线，
+     * @param id
+     * @return
+     */
     private Shop queryWithLogicExpire(Long id) {
         String shopKey = CACHE_SHOP_KEY + id;
         // 1. 从redis中查询商铺信息
@@ -100,6 +115,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return shop;
     }
 
+    /**
+     * 缓存击穿
+     * 一个高并发访问并且缓存重建业务比较复杂的key突然失效，无数的请求访问会在瞬间给数据库带来巨大的冲击
+     * 互斥锁解决缓存穿透高并发下只有一个线程可以获取对redis的访问
+     * @param id
+     * @return
+     */
     private Shop queryWithMutex(Long id) {
         String shopKey = CACHE_SHOP_KEY + id;
         // 1. 从redis中查询商铺信息
@@ -149,6 +171,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return shop;
     }
 
+    /**
+     * 核心思路就是利用redis的setnx方法来表示获取锁，
+     * 该方法含义是redis中如果没有这个key，则插入成功，返回1，在stringRedisTemplate中返回true，
+     * 如果有这个key则插入失败，则返回0，在stringRedisTemplate返回false，
+     * 我们可以通过true，或者是false，来表示是否有线程成功插入key，成功插入的key的线程我们认为他就是获得到锁的线程。
+     * @param key
+     * @return
+     */
     private boolean tryLock(String key) {
         Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
         return BooleanUtil.isTrue(flag);
@@ -157,7 +187,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         stringRedisTemplate.delete(key);
     }
     /**
-     * 缓存击穿
+     * 缓存穿透
+     * 请求数据库不存在的数据缓存总是失效导致给数据库带来巨大请求压力
+     * 使用缓存创建空对象来解决
      * @param id
      * @return
      */
@@ -193,14 +225,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Transactional
     @Override
     public Result update(Shop shop) {
-        String key = CACHE_SHOP_KEY + shop.getId();
-        if (key == null) {
-            return Result.fail("店铺不存在");
+        Long id = shop.getId();
+        if (id == null) {
+            return Result.fail("店铺id不能为空");
         }
         // 1. 更新数据库
         updateById(shop);
         // 2. 删除redis缓存
-        stringRedisTemplate.delete(key);
+        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
         return Result.ok();
     }
 
